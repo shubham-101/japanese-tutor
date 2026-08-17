@@ -1,17 +1,98 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uuid
 import json
 import requests
 import time
+import re
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 app = FastAPI(title="Japanese Tutor API", version="0.1.0")
 
 # Ollama configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "japanese-tutor:latest"  # Use the Japanese tutor model
+
+# Security configuration
+RATE_LIMIT_REQUESTS = 10  # requests per minute
+RATE_LIMIT_WINDOW = 60  # seconds
+rate_limit_storage = defaultdict(list)
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+    return response
+
+# Trusted host middleware (allow localhost for development)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1", "0.0.0.0", "*.local", "*.localhost"]
+)
+
+# Input sanitization function
+def sanitize_input(text: str) -> str:
+    """Sanitize user input to prevent XSS attacks"""
+    if not text:
+        return text
+
+    # HTML escape common characters
+    replacements = {
+        '&': '&',
+        '<': '<',
+        '>': '>',
+        '"': '"',
+        "'": "'",
+        '/': '&#x2F;',
+        '`': '&#x60;',
+        '=': '&#x3D;'
+    }
+
+    for char, escape in replacements.items():
+        text = text.replace(char, escape)
+
+    return text
+
+# Rate limiting middleware
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Skip rate limiting for health checks and docs
+    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json"]:
+        return await call_next(request)
+
+    # Get client identifier (IP address for simplicity)
+    client_ip = request.client.host if request.client else "unknown"
+    now = datetime.now()
+
+    # Clean old requests
+    rate_limit_storage[client_ip] = [
+        req_time for req_time in rate_limit_storage[client_ip]
+        if now - req_time < timedelta(seconds=RATE_LIMIT_WINDOW)
+    ]
+
+    # Check rate limit
+    if len(rate_limit_storage[client_ip]) >= RATE_LIMIT_REQUESTS:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Please try again later."}
+        )
+
+    # Add current request
+    rate_limit_storage[client_ip].append(now)
+
+    response = await call_next(request)
+    return response
 
 def call_ollama(prompt: str, system_prompt: str = None) -> str:
     """Call Ollama API to generate a response"""
@@ -253,7 +334,8 @@ async def send_chat_message(chat: ChatMessage):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     conversation = conversations[chat.conversation_id]
-    user_message = chat.message
+    # Sanitize user input to prevent XSS
+    user_message = sanitize_input(chat.message)
 
     # Build conversation history for context
     # For now, we'll use a simple approach - in a real app, you'd store message history
